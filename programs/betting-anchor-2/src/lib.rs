@@ -149,59 +149,77 @@ pub mod betting_anchor_2 {
         // Ensure market is resolved
         require!(market.resolved, BettingError::MarketNotResolved);
         
-        // Get the winning side (yes_bettors or no_bettors) and total winning amount
-        let (winning_bettors, winning_total, losing_total) = match market.outcome {
-            Outcome::Yes => (&market.yes_bettors, market.total_yes_amount, market.total_no_amount),
-            Outcome::No => (&market.no_bettors, market.total_no_amount, market.total_yes_amount),
+        let outcome = market.outcome;
+        let claimant_key = claimant.key();
+        
+        // Find if claimant is a winner and get their amount
+        let (is_winner, bettor_amount, bettor_index, winning_total, losing_total) = match outcome {
+            Outcome::Yes => {
+                if let Some(index) = market.yes_bettors.iter().position(|b| b.bettor == claimant_key) {
+                    (true, market.yes_bettors[index].amount, index, market.total_yes_amount, market.total_no_amount)
+                } else {
+                    (false, 0, 0, 0, 0)
+                }
+            },
+            Outcome::No => {
+                if let Some(index) = market.no_bettors.iter().position(|b| b.bettor == claimant_key) {
+                    (true, market.no_bettors[index].amount, index, market.total_no_amount, market.total_yes_amount)
+                } else {
+                    (false, 0, 0, 0, 0)
+                }
+            },
             _ => return Err(BettingError::InvalidMarketState.into()),
         };
         
-        // Check if claimant is a winner
-        let claimant_key = claimant.key();
-        let bettor_index = winning_bettors.iter().position(|b| b.bettor == claimant_key);
-        
-        if let Some(index) = bettor_index {
-            let bettor = &winning_bettors[index];
-            
-            // Calculate winnings using integer math only
-            // Original bet + proportional share of losing side
-            // share_of_losers = (bettor_amount * losing_total) / winning_total
-            
-            let share_of_losers = if winning_total > 0 {
-                bettor.amount
-                    .checked_mul(losing_total)
-                    .ok_or(BettingError::OverflowError)?
-                    .checked_div(winning_total)
-                    .ok_or(BettingError::OverflowError)?
-            } else {
-                0
-            };
-            
-            let total_winnings = bettor.amount.checked_add(share_of_losers).ok_or(BettingError::OverflowError)?;
-            
-            // Transfer winnings from market account to claimant
-            **market.to_account_info().try_borrow_mut_lamports()? = market
-                .to_account_info()
-                .lamports()
-                .checked_sub(total_winnings)
-                .ok_or(BettingError::InsufficientFunds)?;
-                
-            **claimant.to_account_info().try_borrow_mut_lamports()? = claimant
-                .to_account_info()
-                .lamports()
-                .checked_add(total_winnings)
-                .ok_or(BettingError::OverflowError)?;
-            
-            emit!(WinningsClaimedEvent {
-                market: market.key(),
-                claimant: claimant_key,
-                amount: total_winnings,
-            });
-            
-            Ok(())
-        } else {
-            Err(BettingError::NotAWinner.into())
+        if !is_winner {
+            return Err(BettingError::NotAWinner.into());
         }
+        
+        // Calculate winnings
+        let share_of_losers = if winning_total > 0 {
+            bettor_amount
+                .checked_mul(losing_total)
+                .ok_or(BettingError::OverflowError)?
+                .checked_div(winning_total)
+                .ok_or(BettingError::OverflowError)?
+        } else {
+            0
+        };
+        
+        let total_winnings = bettor_amount.checked_add(share_of_losers).ok_or(BettingError::OverflowError)?;
+        
+        // Transfer winnings
+        let market_info = market.to_account_info();
+        let claimant_info = claimant.to_account_info();
+        
+        **market_info.try_borrow_mut_lamports()? = market_info.lamports()
+            .checked_sub(total_winnings)
+            .ok_or(BettingError::InsufficientFunds)?;
+            
+        **claimant_info.try_borrow_mut_lamports()? = claimant_info.lamports()
+            .checked_add(total_winnings)
+            .ok_or(BettingError::OverflowError)?;
+        
+        // Remove claimant from winners list and update totals
+        match outcome {
+            Outcome::Yes => {
+                market.yes_bettors.remove(bettor_index);
+                market.total_yes_amount = market.total_yes_amount.checked_sub(bettor_amount).ok_or(BettingError::OverflowError)?;
+            },
+            Outcome::No => {
+                market.no_bettors.remove(bettor_index);
+                market.total_no_amount = market.total_no_amount.checked_sub(bettor_amount).ok_or(BettingError::OverflowError)?;
+            },
+            _ => return Err(BettingError::InvalidMarketState.into()),
+        }
+        
+        emit!(WinningsClaimedEvent {
+            market: market.key(),
+            claimant: claimant_key,
+            amount: total_winnings,
+        });
+        
+        Ok(())
     }
 }
 
